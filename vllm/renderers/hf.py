@@ -467,6 +467,26 @@ def safe_apply_chat_template(
         chat_template_kwargs=kwargs,
     )
 
+    # reasoning_content has been deprecated, and the chat completion endpoint
+    # now returns reasoning field.
+    # However, models may continue to use reasoning_content in their chat templates.
+    # This block adds reasoning_content as an alias to reasoning for back compat.
+    if isinstance(chat_template, str) and "reasoning_content" in chat_template:
+        logger.warning_once(
+            "Chat template is using deprecated reasoning_content field "
+            "and needs to be updated."
+        )
+        conversation_with_alias: list[ConversationMessage] = []
+        for msg in conversation:
+            msg_copy: ConversationMessage = dict(msg)  # type: ignore[assignment, arg-type]
+            if (
+                msg_copy.get("reasoning") is not None
+                and "reasoning_content" not in msg_copy
+            ):
+                msg_copy["reasoning_content"] = msg_copy["reasoning"]
+            conversation_with_alias.append(msg_copy)
+        conversation = conversation_with_alias
+
     try:
         return tokenizer.apply_chat_template(
             conversation=conversation,  # type: ignore[arg-type]
