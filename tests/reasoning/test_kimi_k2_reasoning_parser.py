@@ -233,13 +233,13 @@ def test_reasoning(
         parser, output_tokens, streaming=streaming
     )
 
-    assert reasoning == param_dict["reasoning"], f"Expected reasoning: {param_dict['reasoning']}, got: {reasoning}"
-    assert content == param_dict["content"], f"Expected content: {param_dict['content']}, got: {content}"
+    assert reasoning == param_dict["reasoning"]
+    assert content == param_dict["content"]
 
     # Test is_reasoning_end
     output_ids = kimi_k2_tokenizer.convert_tokens_to_ids(output)
     is_reasoning_end = parser.is_reasoning_end(output_ids)
-    assert is_reasoning_end == param_dict["is_reasoning_end"], f"Expected is_reasoning_end: {param_dict['is_reasoning_end']}, got: {is_reasoning_end}"
+    assert is_reasoning_end == param_dict["is_reasoning_end"]
 
     # Test extract_content_ids
     if param_dict["content"] is not None:
@@ -247,10 +247,10 @@ def test_reasoning(
         expected_content_ids = kimi_k2_tokenizer.convert_tokens_to_ids(
             kimi_k2_tokenizer.tokenize(param_dict["content"])
         )
-        assert content_ids == expected_content_ids, f"Expected content_ids: {expected_content_ids}, got: {content_ids}"
+        assert content_ids == expected_content_ids
     else:
         content_ids = parser.extract_content_ids(output_ids)
-        assert content_ids == [], f"Expected empty content_ids, got: {content_ids}"
+        assert content_ids == []
 
 
 def test_parser_initialization(kimi_k2_tokenizer):

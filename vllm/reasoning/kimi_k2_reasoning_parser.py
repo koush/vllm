@@ -221,7 +221,7 @@ class KimiK2ReasoningParser(DeepSeekR1ReasoningParser):
             # Split at tool call token
             reasoning, _, content = model_output.partition(tool_call_token_found)
             # Add the tool call token back to content
-            final_content = tool_call_token_found + content if content or tool_call_token_found else None
+            final_content = tool_call_token_found + content
             return reasoning, final_content
 
         # Fall back to parent implementation for normal cases
