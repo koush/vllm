@@ -12,15 +12,15 @@ start_token = "<think>"
 end_token = "</think>"
 tool_call_start_token = "<|tool_calls_section_begin|>"
 
-# Use a Kimi K2 model tokenizer for testing
-# If not available, we'll use DeepSeek as a fallback since Kimi K2 uses similar tokens
+# Use any available model tokenizer and add the required tokens
+# We just need a tokenizer that can tokenize our test strings, not the actual Kimi model
 REASONING_MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
 
 @pytest.fixture(scope="module")
 def kimi_k2_tokenizer():
     tokenizer = AutoTokenizer.from_pretrained(REASONING_MODEL_NAME)
-    # Add tool call tokens to the tokenizer vocabulary if not present
+    # Add Kimi K2 tool call tokens to the tokenizer vocabulary
     tool_call_tokens = [
         "<|tool_calls_section_begin|>",
         "<|tool_call_section_begin|>",
