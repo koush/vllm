@@ -1299,13 +1299,18 @@ class DeepseekV2ForCausalLM(
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=os.cpu_count() // 4
         ) as executor:
-            return self._load_weights_executor(weights, executor)
+            ret, futures = self._load_weights_executor(weights, executor)
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+            return ret
 
     def _load_weights_executor(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
         executor: concurrent.futures.Executor,
-    ) -> set[str]:
+    ) -> tuple[str, set[concurrent.futures.Future]]:
+        futures: list[concurrent.futures.Future] = []
+
         rocm_aiter_moe_shared_expert_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         )
@@ -1360,7 +1365,7 @@ class DeepseekV2ForCausalLM(
             )
 
             if loaded_weight.device.type == "cpu":
-                executor.submit(
+                future = executor.submit(
                     self._load_weight,
                     stacked_params_mapping,
                     params_dict,
@@ -1371,6 +1376,7 @@ class DeepseekV2ForCausalLM(
                     loaded_weight,
                     is_fusion_moe_shared_experts_layer,
                 )
+                futures.append(future)
             else:
                 self._load_weight(
                     stacked_params_mapping,
@@ -1383,7 +1389,7 @@ class DeepseekV2ForCausalLM(
                     is_fusion_moe_shared_experts_layer,
                 )
 
-        return loaded_params
+        return loaded_params, futures
 
     def _load_weight(
         self,
