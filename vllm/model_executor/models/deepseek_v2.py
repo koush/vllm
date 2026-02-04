@@ -1297,7 +1297,7 @@ class DeepseekV2ForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=os.cpu_count() // 4
+            max_workers=max(1, (os.cpu_count() or 1) // 4)
         ) as executor:
             ret, futures = self._load_weights_executor(weights, executor)
             for future in concurrent.futures.as_completed(futures):
