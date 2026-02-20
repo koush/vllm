@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from torch.distributed import PrefixStore, ProcessGroup
 
     from vllm.config import VllmConfig
-    from vllm.inputs import ProcessorInputs, PromptType
+    from vllm.inputs import ProcessorInputs
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -34,6 +34,8 @@ def in_wsl() -> bool:
 
 
 class PlatformEnum(enum.Enum):
+    """Enumeration of supported hardware platforms."""
+
     CUDA = enum.auto()
     ROCM = enum.auto()
     TPU = enum.auto()
@@ -191,7 +193,7 @@ class Platform:
         Get the pass manager class for this platform.
         It will be registered as a custom pass under the current_platform.pass_key.
         """
-        return "vllm.compilation.pass_manager.PostGradPassManager"
+        return "vllm.compilation.passes.pass_manager.PostGradPassManager"
 
     @classmethod
     def get_compile_backend(cls) -> str:
@@ -230,6 +232,7 @@ class Platform:
         cls,
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
+        num_heads: int | None = None,
     ) -> str:
         """Get the attention backend class of a device."""
         return ""
@@ -404,6 +407,13 @@ class Platform:
         pass
 
     @classmethod
+    def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
+        """
+        Ensure block_size is compatible with the attention backend.
+        """
+        pass
+
+    @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
         """
         Verify whether the current platform supports the specified model
@@ -565,9 +575,8 @@ class Platform:
     @classmethod
     def validate_request(
         cls,
-        prompt: "PromptType",
-        params: "SamplingParams | PoolingParams",
         processed_inputs: "ProcessorInputs",
+        params: "SamplingParams | PoolingParams",
     ) -> None:
         """Raises if this request is unsupported on this platform"""
 
