@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -71,7 +72,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
         self.device = current_platform.device_type
 
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = hasattr(config, "index_topk") and not envs.VLLM_MLA_FORCE_DENSE
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -194,6 +195,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
             self.quant_config is not None
             and self.quant_config.get_name() == "modelopt_fp4"
         )
+        self.is_v32 = hasattr(self.config, "index_topk") and not envs.VLLM_MLA_FORCE_DENSE
 
     def set_moe_parameters(self):
         self.expert_weights = []
@@ -273,6 +275,8 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            if not self.is_v32 and "indexer." in name:
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
