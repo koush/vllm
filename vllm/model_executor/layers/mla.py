@@ -64,6 +64,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        total_num_heads: int | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -74,6 +75,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.num_heads = num_heads
+        self.total_num_heads = total_num_heads if total_num_heads is not None \
+            else num_heads
         self.fused_qkv_a_proj = mla_modules.fused_qkv_a_proj
         self.kv_a_proj_with_mqa = mla_modules.kv_a_proj_with_mqa
         self.q_a_layernorm = mla_modules.q_a_layernorm
@@ -106,6 +109,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv_b_proj=self.kv_b_proj,
             use_sparse=self.is_sparse,
             indexer=self.indexer,
+            total_num_heads=self.total_num_heads,
         )
 
         self.prefix = prefix
@@ -150,7 +154,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
 
-        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        q = q.view(-1, self.total_num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 

@@ -204,7 +204,12 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed.parallel_state import get_dcp_group, is_global_first_rank
+from vllm.distributed.parallel_state import (
+    get_dcp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    is_global_first_rank,
+)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -293,10 +298,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         prefix: str = "",
         use_sparse: bool = False,
         indexer: object | None = None,
+        total_num_heads: int | None = None,
         **extra_impl_args,
     ):
         super().__init__()
         self.num_heads = num_heads
+        self.total_num_heads = total_num_heads if total_num_heads is not None \
+            else num_heads
         self.scale = scale
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -304,12 +312,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.kv_b_proj = kv_b_proj
+        self.kv_b_proj_is_replicated = False
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
         self.indexer = indexer
 
         self.num_kv_heads = 1
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+
+        # For slicing Q from total_num_heads to local or DCP group heads
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
 
         if cache_config is not None:
             kv_cache_dtype = cache_config.cache_dtype
@@ -374,6 +387,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             v_head_dim=self.v_head_dim,
             kv_b_proj=kv_b_proj,
             indexer=indexer,
+            total_num_heads=self.total_num_heads,
             **extra_impl_args,
         )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
@@ -501,7 +515,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             _ = torch.empty(
                 (
                     self.chunked_prefill_workspace_size,
-                    self.num_heads,
+                    self.total_num_heads,
                     self.qk_nope_head_dim + self.v_head_dim,
                 ),
                 device=k_c_normed.device,
@@ -556,6 +570,48 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mqa_tokens = attn_metadata.num_decode_tokens
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
+        # Slice Q from total_num_heads to the appropriate head range.
+        # With replicated q_b_proj, Q has all heads. We slice to:
+        # - DCP group's heads for decode (MQA) tokens
+        # - Local heads for prefill (MHA) tokens
+        # Also track decode head range for W_UK_T slicing.
+        decode_head_start = 0
+        decode_head_end = self.num_heads
+        if self.total_num_heads != self.num_heads or self.kv_b_proj_is_replicated:
+            dcp_world_size = self.impl.dcp_world_size
+            if dcp_world_size == -1:
+                dcp_world_size = get_dcp_group().world_size
+            if num_mqa_tokens > 0 and dcp_world_size > 1:
+                dcp_size = dcp_world_size
+                dcp_group_id = self.tp_rank // dcp_size
+                decode_head_start = dcp_group_id * dcp_size * self.num_heads
+                decode_head_end = decode_head_start + dcp_size * self.num_heads
+                if self.total_num_heads != self.num_heads:
+                    mqa_q = q[:num_mqa_tokens, decode_head_start:decode_head_end, :]
+                    local_head_start = self.tp_rank * self.num_heads
+                    local_head_end = local_head_start + self.num_heads
+                    mha_q = q[num_mqa_tokens:, local_head_start:local_head_end, :] if num_mha_tokens > 0 else None
+                else:
+                    mqa_q = None
+                    mha_q = None
+            else:
+                if self.total_num_heads != self.num_heads:
+                    decode_head_start = self.tp_rank * self.num_heads
+                    decode_head_end = decode_head_start + self.num_heads
+                    mqa_q = q[:num_mqa_tokens, decode_head_start:decode_head_end, :] if num_mqa_tokens > 0 else None
+                    mha_q = q[num_mqa_tokens:, decode_head_start:decode_head_end, :] if num_mha_tokens > 0 else None
+                else:
+                    mqa_q = None
+                    mha_q = None
+            # Reconstruct q with sliced heads
+            if self.total_num_heads != self.num_heads:
+                if num_mqa_tokens > 0 and num_mha_tokens > 0:
+                    q = torch.cat([mqa_q, mha_q], dim=0)
+                elif num_mqa_tokens > 0:
+                    q = mqa_q
+                else:
+                    q = mha_q
+
         if num_mha_tokens > 0:
             self.impl.forward_mha(
                 q[num_mqa_tokens:],
@@ -578,6 +634,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # Convert from (B, N, P) to (N, B, P)
             mqa_q_nope = mqa_q_nope.transpose(0, 1)
 
+            # Slice W_UK_T / W_K to match decode head range
+            if self.kv_b_proj_is_replicated:
+                W_UK_T_slice = self.W_UK_T[decode_head_start:decode_head_end]
+            else:
+                W_UK_T_slice = self.W_UK_T
+
             if self.q_pad_num_heads is not None:
                 B, N, L = mqa_q_pe.shape
                 mqa_pe_padded = mqa_q_pe.new_empty((B, self.q_pad_num_heads, L))
@@ -588,27 +650,43 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self.is_aiter_triton_fp4_bmm_enabled:
                 from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
+                # Slice W_K to match decode head range
+                if self.kv_b_proj_is_replicated:
+                    W_K_slice = self.W_K[decode_head_start:decode_head_end]
+                    W_K_scale_slice = self.W_K_scale[decode_head_start:decode_head_end]
+                else:
+                    W_K_slice = self.W_K
+                    W_K_scale_slice = self.W_K_scale
+
                 mqa_ql_nope = batched_gemm_a16wfp4(
                     mqa_q_nope,
-                    self.W_K,
-                    self.W_K_scale,
+                    W_K_slice,
+                    W_K_scale_slice,
                     transpose_bm=True,
                     prequant=True,
                     y_scale=self._q_scale if fp8_attention else None,
                 )
             elif self.is_aiter_triton_fp8_bmm_enabled:
+                # Slice W_K to match decode head range
+                if self.kv_b_proj_is_replicated:
+                    W_K_slice = self.W_K[decode_head_start:decode_head_end]
+                    W_K_scale_slice = self.W_K_scale[decode_head_start:decode_head_end]
+                else:
+                    W_K_slice = self.W_K
+                    W_K_scale_slice = self.W_K_scale
+
                 # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
                 mqa_ql_nope = rocm_aiter_ops.triton_fp8_bmm(
                     mqa_q_nope,
-                    self.W_K,
-                    self.W_K_scale,
+                    W_K_slice,
+                    W_K_scale_slice,
                     group_size=128,
                     transpose_bm=True,
                 )
             else:
                 # Pads the head_dim if necessary (for the underlying kernel)
                 N, B, P = mqa_q_nope.shape
-                _, _, L = self.W_UK_T.shape
+                _, _, L = W_UK_T_slice.shape
 
                 if self.q_pad_num_heads is not None:
                     mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
@@ -617,7 +695,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
 
                 # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
+                torch.bmm(mqa_q_nope, W_UK_T_slice, out=mqa_ql_nope)
 
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
@@ -634,8 +712,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 assert not fp8_attention, "DCP not support fp8 kvcache now."
                 # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
                 mqa_q = torch.cat(mqa_q, dim=-1)
-                # mqa_q do allgather in head dim.
-                mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+                # Q already has DCP group's heads from slicing above
+                # (replicated q_b_proj eliminates the all-gather)
 
             # call decode attn
             if not is_sparse_impl:
@@ -663,25 +741,45 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.kv_b_proj, out_dtype=act_dtype
         ).T
 
+        # With replicated kv_b_proj, the weight has total_num_heads heads.
+        # With column-parallel kv_b_proj, the weight has num_heads (local) heads.
+        kv_b_proj_num_heads = kv_b_proj_weight.shape[1] // (
+            self.qk_nope_head_dim + self.v_head_dim
+        )
         assert kv_b_proj_weight.shape == (
             self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            kv_b_proj_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
         ), (
             f"{kv_b_proj_weight.shape=}, "
             f"{self.kv_lora_rank=}, "
-            f"{self.num_heads=}, "
+            f"{kv_b_proj_num_heads=}, "
             f"{self.qk_nope_head_dim=}, "
             f"{self.v_head_dim=}"
         )
         kv_b_proj_weight = kv_b_proj_weight.view(
             self.kv_lora_rank,
-            self.num_heads,
+            kv_b_proj_num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
 
         W_UK, W_UV = kv_b_proj_weight.split(
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
+
+        # If kv_b_proj has all heads (replicated), slice W_UV to local heads
+        # for V-up projection. W_UK_T is kept full for DCP decode absorption.
+        # If kv_b_proj is column-parallel, W_UV and W_UK already have local
+        # heads only.
+        self.kv_b_proj_is_replicated = (
+            kv_b_proj_num_heads == self.total_num_heads
+        )
+        self.impl.kv_b_proj_is_replicated = self.kv_b_proj_is_replicated
+        if self.kv_b_proj_is_replicated:
+            local_head_start = self.tp_rank * self.num_heads
+            local_head_end = local_head_start + self.num_heads
+            W_UV_local = W_UV[:, local_head_start:local_head_end, :]
+        else:
+            W_UV_local = W_UV
 
         # If kv_b_proj_weight is unquantized, quantize it to mxfp4 if supported
         if self.is_aiter_triton_fp4_bmm_enabled:
@@ -695,11 +793,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.W_K_scale = self.W_K_scale.transpose(0, 1)
 
             self.W_V, self.W_V_scale = quark_quantize_weight_to_mxfp4(
-                W_UV.permute(1, 2, 0)
+                W_UV_local.permute(1, 2, 0)
             )
         elif self.is_aiter_triton_fp8_bmm_enabled:
-            W_K = W_UK.transpose(0, 1)  # 16 512 128
-            W_V = W_UV.permute(1, 2, 0)  # 16 128 512
+            W_K = W_UK.transpose(0, 1)  # (N, L, P)
+            W_V = W_UV_local.permute(1, 2, 0)  # (N_local, L, V)
             self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
                 W_K, dtype=current_platform.fp8_dtype()
             )
@@ -739,10 +837,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
                 )
         else:
-            # Convert from (L, N, V) to (N, L, V)
-            self.W_UV = W_UV.transpose(0, 1)
-            # Convert from (L, N, P) to (N, P, L)
-            self.W_UK_T = W_UK.permute(1, 2, 0)
+            # Convert from (L, N_local, V) to (N_local, L, V)
+            self.W_UV = W_UV_local.transpose(0, 1)
+            if self.kv_b_proj_is_replicated:
+                # Convert from (L, N_total, P) to (N_total, P, L) -- all heads
+                self.W_UK_T = W_UK.permute(1, 2, 0)
+            else:
+                # Column-parallel: already has local heads only
+                self.W_UK_T = W_UK.permute(1, 2, 0)
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
@@ -1952,11 +2054,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         kv_b_proj: ColumnParallelLinear,
         indexer: object | None = None,
         q_pad_num_heads: int | None = None,
+        total_num_heads: int | None = None,
     ) -> None:
         if kv_sharing_target_layer_name is not None:
             raise NotImplementedError("KV sharing is not supported for MLA")
 
         self.num_heads = num_heads
+        self.total_num_heads = total_num_heads if total_num_heads is not None \
+            else num_heads
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
@@ -1969,6 +2074,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         self.qk_head_dim = qk_head_dim
         self.v_head_dim = v_head_dim
         self.kv_b_proj = kv_b_proj
+        self.kv_b_proj_is_replicated = False
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.indexer = indexer
         self.q_pad_num_heads = q_pad_num_heads
         self.supports_quant_query_input = True
@@ -2371,8 +2479,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
             k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+                -1, self.total_num_heads if self.kv_b_proj_is_replicated else self.num_heads,
+                self.qk_nope_head_dim + self.v_head_dim
             )
+            if self.kv_b_proj_is_replicated:
+                local_head_start = self.tp_rank * self.num_heads
+                local_head_end = local_head_start + self.num_heads
+                kv_nope = kv_nope[:, local_head_start:local_head_end, :]
 
             # To Do: Use epilogue of kv_b_proj to generate fp8 kv_nope.
             if use_fp8_prefill:
@@ -2481,8 +2594,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             )
 
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+                -1, self.total_num_heads if self.kv_b_proj_is_replicated else self.num_heads,
+                self.qk_nope_head_dim + self.v_head_dim
             )
+            if self.kv_b_proj_is_replicated:
+                local_head_start = self.tp_rank * self.num_heads
+                local_head_end = local_head_start + self.num_heads
+                kv_nope = kv_nope[:, local_head_start:local_head_end, :]
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
@@ -2537,8 +2655,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         has_context = prefill_metadata.chunked_context is not None
 
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            -1, self.total_num_heads if self.kv_b_proj_is_replicated else self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim
         )
+        if self.kv_b_proj_is_replicated:
+            local_head_start = self.tp_rank * self.num_heads
+            local_head_end = local_head_start + self.num_heads
+            kv_nope = kv_nope[:, local_head_start:local_head_end, :]
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
