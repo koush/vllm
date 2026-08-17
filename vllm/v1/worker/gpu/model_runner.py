@@ -130,6 +130,7 @@ from vllm.v1.worker.gpu.lora_utils import (
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -155,6 +156,7 @@ from vllm.v1.worker.gpu.spec_decode.utils import (
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.ubatch_utils import UBatchSlice
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
@@ -241,6 +243,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        if envs.VLLM_GLM52_WAVEFRONT:
+            if not self.model_config.enforce_eager:
+                raise RuntimeError("VLLM_GLM52_WAVEFRONT requires --enforce-eager.")
+            incompatible = []
+            if (
+                self.parallel_config.tensor_parallel_size > 1
+                and not self.parallel_config.disable_custom_all_reduce
+            ):
+                incompatible.append("custom all-reduce")
+            if envs.VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE:
+                incompatible.append("VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE")
+            if envs.VLLM_ENABLE_PCIE_ALLREDUCE:
+                incompatible.append("VLLM_ENABLE_PCIE_ALLREDUCE")
+            if incompatible:
+                raise RuntimeError(
+                    "VLLM_GLM52_WAVEFRONT is incompatible with "
+                    + ", ".join(incompatible)
+                )
+            if envs.VLLM_GLM52_WAVEFRONT_CHUNK_SIZE <= 0:
+                raise RuntimeError("VLLM_GLM52_WAVEFRONT_CHUNK_SIZE must be positive.")
 
         self.device = device
         self.dtype = self.model_config.dtype
@@ -1720,6 +1742,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         max_req_tokens = max_query_len
         skip_compiled = False
         verification_capacity_manager = self.verification_capacity_manager
+        wavefront_chunk_size = envs.VLLM_GLM52_WAVEFRONT_CHUNK_SIZE
+        architectures = self.model_config.hf_config.architectures or ()
+        wavefront_candidate = (
+            envs.VLLM_GLM52_WAVEFRONT
+            and not dummy_run
+            and "GlmMoeDsaForCausalLM" in architectures
+            and num_reqs == 1
+            and num_toks == 2 * wavefront_chunk_size
+            and not scheduler_output.scheduled_spec_decode_tokens
+            and not scheduler_output.scheduled_encoder_inputs
+            and self.parallel_config.pipeline_parallel_size == 1
+            and not self.supports_mm_inputs
+            and self.lora_config is None
+            and self.pcp_manager is None
+            and isinstance(self.model_state, DefaultModelState)
+            and self.routed_experts_capturer is None
+        )
+        if wavefront_candidate:
+            skip_compiled = True
 
         num_active_loras = 0
         if self.lora_config:
@@ -1854,32 +1895,66 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         attn_metadata = None
         slot_mappings_by_layer = None
+        ubatch_slices = None
         if not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
-            with record_function_or_nullcontext(
-                f"vllm:v2/target/{phase}/slot_mappings_by_layer"
-            ):
-                slot_mappings_by_layer = build_slot_mappings_by_layer(
-                    slot_mappings, self.kv_cache_config
-                )
             assert block_tables is not None
-            with record_function_or_nullcontext(
-                f"vllm:v2/target/{phase}/build_attn_metadata"
-            ):
-                attn_metadata = self.model_state.prepare_attn(
-                    input_batch,
-                    batch_desc.cg_mode,
-                    block_tables,
-                    slot_mappings,
-                    self.attn_groups,
-                    self.kv_cache_config,
-                    # FULL replay reads capture-time metadata buffers. Re-stage them
-                    # from the zeroed dummy block tables instead of retaining state
-                    # indices from the previous real batch.
-                    for_capture=(
-                        dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL
-                    ),
+            wavefront_eligible = (
+                wavefront_candidate
+                and input_batch.num_reqs == 1
+                and input_batch.num_tokens == 2 * wavefront_chunk_size
+                and input_batch.num_tokens_after_padding == input_batch.num_tokens
+                and input_batch.num_draft_tokens == 0
+                and bool(input_batch.is_prefilling_np[0])
+            )
+            if wavefront_eligible:
+                assert isinstance(self.model_state, DefaultModelState)
+                attn_metadata, raw_slot_mappings = (
+                    self.model_state.prepare_glm52_wavefront_attn(
+                        input_batch,
+                        block_tables,
+                        slot_mappings,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                        wavefront_chunk_size,
+                        self.dcp_rank,
+                    )
                 )
+                slot_mappings_by_layer = [
+                    build_slot_mappings_by_layer(mapping, self.kv_cache_config)
+                    for mapping in raw_slot_mappings
+                ]
+                ubatch_slices = [
+                    UBatchSlice(slice(0, 1), slice(0, wavefront_chunk_size)),
+                    UBatchSlice(
+                        slice(0, 1),
+                        slice(wavefront_chunk_size, 2 * wavefront_chunk_size),
+                    ),
+                ]
+                skip_compiled = True
+            else:
+                with record_function_or_nullcontext(
+                    f"vllm:v2/target/{phase}/slot_mappings_by_layer"
+                ):
+                    slot_mappings_by_layer = build_slot_mappings_by_layer(
+                        slot_mappings, self.kv_cache_config
+                    )
+                with record_function_or_nullcontext(
+                    f"vllm:v2/target/{phase}/build_attn_metadata"
+                ):
+                    attn_metadata = self.model_state.prepare_attn(
+                        input_batch,
+                        batch_desc.cg_mode,
+                        block_tables,
+                        slot_mappings,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                        # FULL replay reads capture-time metadata buffers. Re-stage
+                        # them from zeroed dummy tables instead of retaining state.
+                        for_capture=(
+                            dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL
+                        ),
+                    )
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -1988,6 +2063,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     cudagraph_runtime_mode=batch_desc.cg_mode,
                     num_tokens_across_dp=num_tokens_across_dp,
                     batch_descriptor=batch_descriptor,
+                    ubatch_slices=ubatch_slices,
                     slot_mapping=slot_mappings_by_layer,
                     skip_compiled=skip_compiled,
                     is_padding=input_batch.is_padding,
@@ -2006,6 +2082,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        if ubatch_slices is not None and self.speculator is not None:
+            assert slot_mappings is not None
+            assert block_tables is not None
+            slot_mappings_by_layer = build_slot_mappings_by_layer(
+                slot_mappings, self.kv_cache_config
+            )
+            attn_metadata = self.model_state.prepare_attn(
+                input_batch,
+                batch_desc.cg_mode,
+                block_tables,
+                slot_mappings,
+                self.attn_groups,
+                self.kv_cache_config,
+            )
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

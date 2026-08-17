@@ -71,6 +71,39 @@ DEVICE_TYPE = current_platform.device_type
 
 
 @pytest.mark.cpu_test
+def test_mla_forward_orders_cache_update_before_attention():
+    q = torch.zeros(1, 1, 1)
+    kv = torch.zeros(1, 1)
+    k_pe = torch.zeros(1, 1, 1)
+    expected = torch.ones(1, 1)
+    cache_state = object()
+    calls = []
+    layer = SimpleNamespace()
+
+    def cache_update(actual_kv, actual_k_pe):
+        calls.append("cache")
+        assert actual_kv is kv
+        assert actual_k_pe is k_pe
+        return cache_state
+
+    def attention(actual_q, actual_kv, actual_k_pe, actual_state, **kwargs):
+        calls.append("attention")
+        assert actual_q is q
+        assert actual_kv is kv
+        assert actual_k_pe is k_pe
+        assert actual_state is cache_state
+        assert kwargs["output_shape"] == (1, 1)
+        return expected
+
+    layer.forward_cache_update = cache_update
+    layer.forward_after_cache_update = attention
+    actual = MLAAttention.forward(layer, q, kv, k_pe, output_shape=(1, 1))
+
+    assert actual is expected
+    assert calls == ["cache", "attention"]
+
+
+@pytest.mark.cpu_test
 def test_mla_post_load_preallocates_quantized_absorbed_weights(monkeypatch):
     layer = MLAAttention.__new__(MLAAttention)
     torch.nn.Module.__init__(layer)

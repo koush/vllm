@@ -192,3 +192,103 @@ class DefaultModelState(ModelState):
             max_req_tokens=input_batch.max_req_tokens or 0,
         )
         return attn_metadata
+
+    def prepare_glm52_wavefront_attn(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        chunk_size: int,
+        dcp_rank: int,
+    ) -> tuple[list[dict[str, Any]], list[torch.Tensor]]:
+        """Build metadata for the two strict GLM-5.2 wavefront lanes."""
+        if (
+            chunk_size <= 0
+            or input_batch.num_reqs != 1
+            or input_batch.num_tokens != 2 * chunk_size
+            or input_batch.num_tokens_after_padding != input_batch.num_tokens
+            or input_batch.num_draft_tokens != 0
+            or not bool(input_batch.is_prefilling_np[0])
+            or input_batch.num_scheduled_tokens.tolist() != [2 * chunk_size]
+            or input_batch.query_start_loc_np[:2].tolist() != [0, 2 * chunk_size]
+            or bool(input_batch.is_padding[: input_batch.num_tokens].any().item())
+            or slot_mappings.shape[1] < input_batch.num_tokens
+        ):
+            raise RuntimeError(
+                "GLM-5.2 wavefront metadata requires one unpadded text prefill "
+                "request with exactly two chunks and no draft tokens."
+            )
+
+        parallel_config = self.vllm_config.parallel_config
+        dcp_size = parallel_config.decode_context_parallel_size
+        cp_interleave = parallel_config.cp_kv_cache_interleave_size
+        query_start_loc_cpu = torch.tensor([0, chunk_size], dtype=torch.int32)
+        query_start_loc_gpu = input_batch.query_start_loc.new_tensor([0, chunk_size])
+        final_seq_lens = input_batch.seq_lens[:1]
+        final_upper_bounds = input_batch.seq_lens_cpu_upper_bound[:1]
+        lane_seq_lens = [final_seq_lens - chunk_size, final_seq_lens]
+        lane_upper_bounds = [
+            final_upper_bounds - chunk_size,
+            final_upper_bounds,
+        ]
+        raw_slot_mappings = [
+            slot_mappings[:, :chunk_size],
+            slot_mappings[:, chunk_size : 2 * chunk_size],
+        ]
+        metadata: list[dict[str, Any]] = []
+        for lane_idx in range(2):
+            seq_lens = lane_seq_lens[lane_idx]
+            upper_bounds = lane_upper_bounds[lane_idx]
+            dcp_local_seq_lens = None
+            if dcp_size > 1:
+                width = dcp_size * cp_interleave
+                remainder = torch.clamp(
+                    seq_lens % width - dcp_rank * cp_interleave,
+                    min=0,
+                    max=cp_interleave,
+                )
+                dcp_local_seq_lens = seq_lens // width * cp_interleave + remainder
+            token_start = lane_idx * chunk_size
+            metadata.append(
+                build_attn_metadata(
+                    attn_groups=attn_groups,
+                    num_reqs=1,
+                    num_tokens=chunk_size,
+                    query_start_loc_gpu=query_start_loc_gpu,
+                    query_start_loc_cpu=query_start_loc_cpu,
+                    max_query_len=chunk_size,
+                    seq_lens=seq_lens,
+                    max_seq_len=int(upper_bounds[0]),
+                    block_tables=block_tables,
+                    slot_mappings=raw_slot_mappings[lane_idx],
+                    kv_cache_config=kv_cache_config,
+                    seq_lens_cpu_upper_bound=upper_bounds,
+                    max_seq_len_upper_bound=int(upper_bounds[0]),
+                    dcp_local_seq_lens=dcp_local_seq_lens,
+                    positions=input_batch.positions[
+                        token_start : token_start + chunk_size
+                    ],
+                    is_prefilling=torch.ones(1, dtype=torch.bool),
+                    rswa_prefix_lens=input_batch.prompt_lens,
+                    max_req_tokens=chunk_size,
+                    metadata_builder_idx=lane_idx,
+                )
+            )
+        from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+            B12xMLASparseMetadata,
+            link_glm52_wavefront_ckv_metadata,
+        )
+
+        linked: set[tuple[int, int]] = set()
+        for layer_name, lane_0_metadata in metadata[0].items():
+            lane_1_metadata = metadata[1][layer_name]
+            pair = (id(lane_0_metadata), id(lane_1_metadata))
+            if pair in linked or not isinstance(lane_0_metadata, B12xMLASparseMetadata):
+                continue
+            if not isinstance(lane_1_metadata, B12xMLASparseMetadata):
+                raise RuntimeError("Wavefront lanes use different attention backends")
+            link_glm52_wavefront_ckv_metadata(lane_0_metadata, lane_1_metadata)
+            linked.add(pair)
+        return metadata, raw_slot_mappings

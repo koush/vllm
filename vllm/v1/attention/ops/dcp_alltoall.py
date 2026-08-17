@@ -28,6 +28,7 @@ import torch
 import torch.distributed as dist
 
 import vllm.envs as envs
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import is_vllm_cudagraph_capture_active
@@ -45,11 +46,23 @@ _B12X_DCP_A2A_DISABLED: set[tuple[int, int, int, int, int, int]] = set()
 # DCP likewise has one stable eager scheduler owner.  Graph target/draft/encoder
 # identities are supplied separately by their GraphCaptureContext.
 _B12X_DCP_EAGER_CHANNEL_ID = "vllm:eager:dcp"
+_B12X_DCP_WAVEFRONT_CHANNEL_IDS = (
+    "vllm:eager:dcp:wavefront:0",
+    "vllm:eager:dcp:wavefront:1",
+)
 _B12X_DCP_MAX_CONCURRENT_CHANNELS = 2
 _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
+
+
+def _b12x_dcp_eager_channel_id() -> str:
+    if envs.VLLM_GLM52_WAVEFRONT and is_forward_context_available():
+        lane = get_forward_context().additional_kwargs.get("glm52_wavefront_lane")
+        if lane in (0, 1):
+            return _B12X_DCP_WAVEFRONT_CHANNEL_IDS[lane]
+    return _B12X_DCP_EAGER_CHANNEL_ID
 
 
 def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
@@ -135,7 +148,10 @@ def _get_b12x_dcp_a2a_pool(
             single_channel=False,
             max_concurrent_channels=_B12X_DCP_MAX_CONCURRENT_CHANNELS,
         )
-        pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID,))
+        channel_ids = (_B12X_DCP_EAGER_CHANNEL_ID,)
+        if envs.VLLM_GLM52_WAVEFRONT:
+            channel_ids += _B12X_DCP_WAVEFRONT_CHANNEL_IDS
+        pool.prepare_channels(channel_ids)
         pool.for_stream(channel_id=_B12X_DCP_EAGER_CHANNEL_ID)
     except Exception as exc:
         init_error = exc
@@ -321,12 +337,16 @@ def _try_b12x_dcp_lse_reduce(
         dtype=cp_attn_out.dtype,
     )
     reduced = reduced_storage.transpose(0, 1)
+    channel_id = _b12x_dcp_eager_channel_id()
+    bind_stream = getattr(pool, "for_stream", None)
+    if callable(bind_stream):
+        bind_stream(channel_id=channel_id)
     return pool.lse_reduce_scatter(
         cp_attn_out,
         cp_attn_lse,
         out=reduced,
         is_lse_base_on_e=is_lse_base_on_e,
-        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+        channel_id=channel_id,
     )
 
 
@@ -377,9 +397,13 @@ def _try_b12x_dcp_all_gather_heads(
     )
     if pool is None:
         return None
+    channel_id = _b12x_dcp_eager_channel_id()
+    bind_stream = getattr(pool, "for_stream", None)
+    if callable(bind_stream):
+        bind_stream(channel_id=channel_id)
     return pool.all_gather_heads(
         local_input,
-        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+        channel_id=channel_id,
     )
 
 

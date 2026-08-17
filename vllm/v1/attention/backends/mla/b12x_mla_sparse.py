@@ -28,7 +28,7 @@ ONE ``get_simultaneous`` call so they never alias.
 import inspect
 import os
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
@@ -38,6 +38,7 @@ import torch.distributed as dist
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
 from vllm.model_executor.layers.mla_cache_format import (
@@ -196,8 +197,24 @@ def _ckv_prefetch_workspace_nbytes(
     )
 
 
-def _ckv_prefetch_execution_lanes(num_ubatches: int, speculative: bool) -> int:
+def _ckv_prefetch_execution_lanes(
+    num_ubatches: int,
+    speculative: bool,
+    wavefront: bool = False,
+) -> int:
+    del wavefront
     return max(1, int(num_ubatches)) * (2 if speculative else 1)
+
+
+def _glm52_wavefront_lane() -> int | None:
+    if not is_forward_context_available():
+        return None
+    lane = get_forward_context().additional_kwargs.get("glm52_wavefront_lane")
+    return lane if lane in (0, 1) else None
+
+
+def _ckv_prefetch_depth_for_lane(configured_depth: int, lane: int | None) -> int:
+    return 0 if lane == 1 else int(configured_depth)
 
 
 class _CKVPrefetchWorkspacePool:
@@ -873,9 +890,41 @@ class B12xMLASparseMetadata(AttentionMetadata):
     dcp_padded_total_tokens: int = 0
     dcp_ckv_gather_eligible: bool = False
     ckv_prefetch_registry: _CKVPrefetchStateRegistry | None = None
+    ckv_wavefront_handoff: "_CKVWavefrontHandoff | None" = None
+    ckv_wavefront_lane: int | None = None
 
     block_size: int = 64
     topk_tokens: int = 2048
+
+
+@dataclass
+class _CKVWavefrontLayerHandoff:
+    kv_cache: torch.Tensor
+    ready_event: torch.cuda.Event
+    buf_idx: int
+
+
+@dataclass
+class _CKVWavefrontHandoff:
+    layers: dict[int, _CKVWavefrontLayerHandoff] = field(default_factory=dict)
+    released_slots: dict[int, torch.cuda.Event] = field(default_factory=dict)
+
+
+def link_glm52_wavefront_ckv_metadata(
+    lane_0: B12xMLASparseMetadata,
+    lane_1: B12xMLASparseMetadata,
+) -> None:
+    """Give both chunks one final-context gathered-CKV layout and handoff."""
+    if lane_0.num_reqs != 1 or lane_1.num_reqs != 1:
+        raise ValueError("GLM-5.2 CKV wavefront requires one request")
+    if lane_1.dcp_padded_total_tokens < lane_0.dcp_padded_total_tokens:
+        raise ValueError("Wavefront CKV layout cannot shrink between lanes")
+    lane_0.dcp_padded_total_tokens = lane_1.dcp_padded_total_tokens
+    handoff = _CKVWavefrontHandoff()
+    lane_0.ckv_wavefront_handoff = handoff
+    lane_1.ckv_wavefront_handoff = handoff
+    lane_0.ckv_wavefront_lane = 0
+    lane_1.ckv_wavefront_lane = 1
 
 
 class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadata]):
@@ -1620,6 +1669,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         execution_lanes = _ckv_prefetch_execution_lanes(
             parallel_config.num_ubatches,
             spec is not None,
+            envs_mod.VLLM_GLM52_WAVEFRONT,
         )
         self._ckv_workspace_pool = (
             _get_ckv_prefetch_workspace_pool(
@@ -2224,6 +2274,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         else:
             stream_ctx = torch.cuda.stream(torch.cuda.current_stream())
         with stream_ctx:
+            handoff = attn_metadata.ckv_wavefront_handoff
+            if attn_metadata.ckv_wavefront_lane == 0 and handoff is not None:
+                release_event = handoff.released_slots.pop(buf_idx, None)
+                if release_event is not None:
+                    release_event.wait()
             if local_tokens:
                 ops.cp_gather_cache(
                     src_cache=kv_cache,
@@ -2240,13 +2295,12 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 get_dcp_group,
             )
 
-            # The prefetch (side stream) uses a dedicated communicator so it
-            # cannot collide with the indexer's DCP merge on the default
-            # stream; the synchronous path shares the default stream with the
-            # merge and is safe on the main DCP communicator.
-            dcp_group = (
-                get_dcp_ckv_prefetch_group() if stream is not None else get_dcp_group()
-            )
+            wavefront_lane = _glm52_wavefront_lane()
+            if wavefront_lane == 0 or stream is not None:
+                dcp_group = get_dcp_ckv_prefetch_group()
+            else:
+                # Serial synchronous gathers share the main DCP communicator.
+                dcp_group = get_dcp_group()
             _dcp_all_gather_current_stream(
                 dcp_group,
                 local_buffer[:padded_tokens].view(-1),
@@ -2688,57 +2742,99 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 "B12X_MLA_SPARSE requires a contiguous native paged KV cache; "
                 f"got stride={tuple(kv_cache.stride())}"
             )
+        wavefront_lane = None
+        layer_idx = None
+        current_buf_idx = None
         if use_ckv_gather:
-            layer_idx = self._resolve_layer_index(layer)
-            prefetch_registry = attn_metadata.ckv_prefetch_registry
-            if prefetch_registry is None:
-                raise RuntimeError("CKV gather requires a prefetch state registry")
-            if self._ckv_workspace_pool is None:
-                raise RuntimeError("CKV gather requires a persistent workspace pool")
-            prefetch_state = prefetch_registry.for_workspace(
-                q_workspace,
-                layer_idx,
-                kv_cache,
-                workspace_pool=self._ckv_workspace_pool,
-            )
-            ckv_workspace = prefetch_state.get_ckv_workspace(self._ckv_workspace_nbytes)
-            if layer_idx is not None and self._ckv_prefetch_depth > 0:
-                prefetch_state.enter_layer(layer_idx)
-                prefetch_state.register_cache(layer_idx, kv_cache)
-            pending = (
-                prefetch_state.pending_layers.pop(layer_idx, None)
-                if layer_idx is not None and self._ckv_prefetch_depth > 0
-                else None
-            )
-            if pending is not None:
-                gather_event, current_buf_idx = pending
-                gather_event.wait()
-                _, gathered_buffer = self._ckv_workspace_views(
-                    ckv_workspace, current_buf_idx
+            wavefront_lane = _glm52_wavefront_lane()
+            if wavefront_lane != attn_metadata.ckv_wavefront_lane:
+                raise RuntimeError(
+                    "CKV wavefront lane metadata does not match forward context"
                 )
-                kv_cache = gathered_buffer[
-                    : self.dcp_world_size * self._ckv_local_capacity
-                ].view(-1, self.block_size, self._kv_record_bytes)
+            prefetch_depth = _ckv_prefetch_depth_for_lane(
+                self._ckv_prefetch_depth, wavefront_lane
+            )
+            layer_idx = self._resolve_layer_index(layer)
+            handoff = attn_metadata.ckv_wavefront_handoff
+            if wavefront_lane == 1:
+                if layer_idx is None or handoff is None:
+                    raise RuntimeError("CKV wavefront lane 1 is missing its handoff")
+                layer_handoff = handoff.layers.pop(layer_idx, None)
+                if layer_handoff is None:
+                    raise RuntimeError(
+                        f"CKV wavefront layer {layer_idx} was not gathered by lane 0"
+                    )
+                layer_handoff.ready_event.wait()
+                kv_cache = layer_handoff.kv_cache
+                current_buf_idx = layer_handoff.buf_idx
                 self._append_current_chunk_to_gathered(
                     kv_cache, attn_metadata, layer, num_actual_toks
                 )
             else:
-                # The ring shares one local staging region across gathered
-                # slots. An irregular fallback can occur while a future layer
-                # is pending, so order this main-stream write after all current
-                # side-stream users without increasing the persistent pool.
-                prefetch_state.wait_for_pending_writes()
-                current_buf_idx = (
-                    layer_idx % self._ckv_workspace_slots
-                    if layer_idx is not None
-                    else 0
-                )
-                kv_cache = self._dcp_gather_ckv(
+                prefetch_registry = attn_metadata.ckv_prefetch_registry
+                if prefetch_registry is None:
+                    raise RuntimeError("CKV gather requires a prefetch state registry")
+                if self._ckv_workspace_pool is None:
+                    raise RuntimeError(
+                        "CKV gather requires a persistent workspace pool"
+                    )
+                prefetch_state = prefetch_registry.for_workspace(
+                    q_workspace,
+                    layer_idx,
                     kv_cache,
-                    attn_metadata,
-                    ckv_workspace,
-                    buf_idx=current_buf_idx,
+                    workspace_pool=self._ckv_workspace_pool,
                 )
+                ckv_workspace = prefetch_state.get_ckv_workspace(
+                    self._ckv_workspace_nbytes
+                )
+                if layer_idx is not None and prefetch_depth > 0:
+                    prefetch_state.enter_layer(layer_idx)
+                    prefetch_state.register_cache(layer_idx, kv_cache)
+                pending = (
+                    prefetch_state.pending_layers.pop(layer_idx, None)
+                    if layer_idx is not None and prefetch_depth > 0
+                    else None
+                )
+                if pending is not None:
+                    gather_event, current_buf_idx = pending
+                    gather_event.wait()
+                    _, gathered_buffer = self._ckv_workspace_views(
+                        ckv_workspace, current_buf_idx
+                    )
+                    kv_cache = gathered_buffer[
+                        : self.dcp_world_size * self._ckv_local_capacity
+                    ].view(-1, self.block_size, self._kv_record_bytes)
+                    self._append_current_chunk_to_gathered(
+                        kv_cache, attn_metadata, layer, num_actual_toks
+                    )
+                else:
+                    # The ring shares one local staging region across gathered
+                    # slots. Order fallback writes after pending side-stream users.
+                    prefetch_state.wait_for_pending_writes()
+                    current_buf_idx = (
+                        layer_idx % self._ckv_workspace_slots
+                        if layer_idx is not None
+                        else 0
+                    )
+                    kv_cache = self._dcp_gather_ckv(
+                        kv_cache,
+                        attn_metadata,
+                        ckv_workspace,
+                        buf_idx=current_buf_idx,
+                    )
+                if wavefront_lane == 0:
+                    if layer_idx is None or handoff is None:
+                        raise RuntimeError(
+                            "CKV wavefront lane 0 is missing its handoff"
+                        )
+                    assert current_buf_idx is not None
+                    ready_event = torch.cuda.Event(blocking=False)
+                    ready_event.record(torch.cuda.current_stream())
+                    handoff.layers[layer_idx] = _CKVWavefrontLayerHandoff(
+                        kv_cache,
+                        ready_event,
+                        current_buf_idx,
+                    )
             logger.info_once(
                 "Using transient full-CKV gather for B12X sparse MLA prefill "
                 "(capacity=%d logical tokens)",
@@ -2746,7 +2842,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             )
             if (
                 self._ckv_prefetch_supported
-                and self._ckv_prefetch_depth > 0
+                and prefetch_depth > 0
                 and layer_idx is not None
             ):
                 # The first eligible request only discovers one layer cache at
@@ -2754,7 +2850,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 # cache registry for subsequent requests.
                 targets = _ckv_prefetch_target_indices(
                     layer_idx,
-                    self._ckv_prefetch_depth,
+                    prefetch_depth,
                     prefetch_state.layer_caches,
                     prefetch_state.pending_layers,
                 )
@@ -2789,6 +2885,8 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             and num_actual_toks <= attn_metadata.num_reqs * self.spec_decode_max_q
             and num_actual_toks <= self._decode_max_rows
         )
+        if wavefront_lane is not None and use_decode_kernel:
+            raise RuntimeError("CKV wavefront requires the prefill attention kernel")
         if use_decode_kernel:
             cache_seqlens = (
                 attn_metadata.cache_seq_lens_per_req
@@ -2904,4 +3002,12 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 out = dense_out
                 if lse is not None:
                     lse = lse[:, : self._input_num_heads]
+        if wavefront_lane == 1:
+            assert current_buf_idx is not None
+            assert attn_metadata.ckv_wavefront_handoff is not None
+            release_event = torch.cuda.Event(blocking=False)
+            release_event.record(torch.cuda.current_stream())
+            attn_metadata.ckv_wavefront_handoff.released_slots[current_buf_idx] = (
+                release_event
+            )
         return out, lse

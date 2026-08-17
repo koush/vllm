@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import (
     VllmConfig,
     get_layers_from_vllm_config,
@@ -159,7 +160,14 @@ def init_attn_backend(
     kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
 
     # Phase 3: create metadata builders and determine cudagraph support.
-    attn_backend_workspace: torch.Tensor | None = None
+    architectures = vllm_config.model_config.hf_config.architectures or ()
+    use_glm52_wavefront = (
+        envs.VLLM_GLM52_WAVEFRONT and "GlmMoeDsaForCausalLM" in architectures
+    )
+    num_metadata_builders = 2 if use_glm52_wavefront else 1
+    attn_backend_workspaces: list[torch.Tensor | None] = [None] * (
+        num_metadata_builders
+    )
     min_cg_support = AttentionCGSupport.ALWAYS
     min_cg_attn_backend = None
     for kv_cache_group_id, groups in enumerate(attn_groups):
@@ -171,15 +179,19 @@ def init_attn_backend(
                 vllm_config=vllm_config,
                 device=device,
                 kernel_block_size=kernel_block_size,
-                num_metadata_builders=1,
+                num_metadata_builders=num_metadata_builders,
             )
+            for builder_idx in range(num_metadata_builders):
+                builder = group.get_metadata_builder(builder_idx)
+                workspace = attn_backend_workspaces[builder_idx]
+                if workspace is None:
+                    if hasattr(builder, "_get_workspace_buffer"):
+                        attn_backend_workspaces[builder_idx] = (
+                            builder._get_workspace_buffer()
+                        )
+                elif hasattr(builder, "set_workspace_buffer"):
+                    builder.set_workspace_buffer(workspace)
             builder = group.get_metadata_builder(0)
-            if attn_backend_workspace is None:
-                if hasattr(builder, "_get_workspace_buffer"):
-                    attn_backend_workspace = builder._get_workspace_buffer()
-            else:
-                if hasattr(builder, "set_workspace_buffer"):
-                    builder.set_workspace_buffer(attn_backend_workspace)
             # Check cudagraph support for the attention backend
             cg_support = builder.get_cudagraph_support(
                 vllm_config,
@@ -555,6 +567,7 @@ def build_attn_metadata(
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
     max_req_tokens: int = 0,
+    metadata_builder_idx: int = 0,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -624,7 +637,9 @@ def build_attn_metadata(
             common_attn_metadata._num_computed_tokens_cache = shared_num_computed_tokens
 
         for attn_group in attn_groups[i]:
-            attn_metadata_builder = attn_group.get_metadata_builder(0)
+            attn_metadata_builder = attn_group.get_metadata_builder(
+                metadata_builder_idx
+            )
             can_reuse_exact_metadata = (
                 not for_cudagraph_capture
                 and attn_metadata_builder.supports_exact_metadata_reuse
@@ -633,7 +648,7 @@ def build_attn_metadata(
                 exact_attention_metadata_cache_key(
                     attn_group.kv_cache_spec,
                     type(attn_metadata_builder),
-                    0,
+                    metadata_builder_idx,
                     common_attn_metadata,
                 )
                 if can_reuse_exact_metadata

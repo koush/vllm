@@ -26,6 +26,8 @@
 
 import typing
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
+from dataclasses import replace
 from itertools import islice
 
 import torch
@@ -45,6 +47,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention, RSWAAttention
@@ -64,7 +67,11 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
+from vllm.model_executor.layers.mla import (
+    MLAModules,
+    MLAWavefrontState,
+    MultiHeadLatentAttentionWrapper,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
@@ -101,6 +108,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerBackend,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+from vllm.v1.worker.workspace import use_workspace_lane
 
 from .interfaces import (
     MixtureOfExperts,
@@ -1592,6 +1600,52 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
+    def forward_wavefront_prefix(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> tuple[MLAWavefrontState, torch.Tensor]:
+        if self.use_sequence_parallel_moe:
+            raise RuntimeError(
+                "GLM-5.2 wavefront does not support sequence-parallel MoE."
+            )
+        if not isinstance(self.self_attn, DeepseekV2MLAAttention):
+            raise RuntimeError("GLM-5.2 wavefront requires MLA attention.")
+
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        state = self.self_attn.mla_attn.forward_wavefront_prefix(
+            positions, hidden_states, llama_4_scaling
+        )
+        return state, residual
+
+    def forward_wavefront_tail(
+        self,
+        state: MLAWavefrontState,
+        residual: torch.Tensor,
+        before_o_proj_reduce: Callable[[], None] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert isinstance(self.self_attn, DeepseekV2MLAAttention)
+        hidden_states = self.self_attn.mla_attn.forward_wavefront_tail(
+            state, before_o_proj_reduce
+        )
+        if hidden_states.dtype == torch.float16:
+            hidden_states *= 1.0 / self.routed_scaling_factor
+            if self.layer_idx == 0:
+                residual *= 1.0 / self.routed_scaling_factor
+
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
+            hidden_states *= 1.0 / self.routed_scaling_factor
+        return hidden_states, residual
+
 
 @support_torch_compile
 class DeepseekV2Model(nn.Module):
@@ -1630,6 +1684,8 @@ class DeepseekV2Model(nn.Module):
         else:
             topk_indices_buffer = None
             topk_scores_buffer = None
+        self._wavefront_topk_indices_buffer = topk_indices_buffer
+        self._wavefront_topk_scores_buffer = topk_scores_buffer
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -2021,6 +2077,203 @@ class DeepseekV2Model(nn.Module):
         return loaded_params
 
 
+@contextmanager
+def _bind_glm_wavefront_topk(
+    layer: DeepseekV2DecoderLayer,
+    indices: torch.Tensor,
+    scores: torch.Tensor | None,
+):
+    self_attn = layer.self_attn
+    wrapper = getattr(self_attn, "mla_attn", None)
+    indexer = getattr(wrapper, "indexer", None)
+    indexer_op = getattr(indexer, "indexer_op", None)
+    mla_layer = getattr(wrapper, "mla_attn", None)
+    mla_impl = getattr(mla_layer, "impl", None)
+    owners = (self_attn, wrapper, indexer, indexer_op, mla_layer, mla_impl)
+    previous = []
+    for owner in owners:
+        if owner is None:
+            continue
+        for name, value in (
+            ("topk_indices_buffer", indices),
+            ("topk_scores_buffer", scores),
+        ):
+            if hasattr(owner, name):
+                previous.append((owner, name, getattr(owner, name)))
+                setattr(owner, name, value)
+    try:
+        yield
+    finally:
+        for owner, name, value in reversed(previous):
+            setattr(owner, name, value)
+
+
+class GlmMoeDsaModel(DeepseekV2Model):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._wavefront_streams: tuple[torch.cuda.Stream, torch.cuda.Stream] | None = (
+            None
+        )
+        self._wavefront_oproj_ready: list[torch.cuda.Event] = []
+        self._wavefront_input_ready: torch.cuda.Event | None = None
+        self._wavefront_done: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+
+    def _init_wavefront_runtime(self) -> None:
+        if self._wavefront_streams is not None:
+            return
+        low_priority, high_priority = torch.cuda.Stream.priority_range()
+        self._wavefront_streams = (
+            torch.cuda.Stream(priority=high_priority),
+            torch.cuda.Stream(priority=low_priority),
+        )
+        self._wavefront_oproj_ready = [
+            torch.cuda.Event() for _ in range(self.end_layer - self.start_layer)
+        ]
+        self._wavefront_input_ready = torch.cuda.Event()
+        self._wavefront_done = (torch.cuda.Event(), torch.cuda.Event())
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        context = get_forward_context()
+        if context.ubatch_slices is None:
+            return super().forward(
+                input_ids, positions, intermediate_tensors, inputs_embeds
+            )
+        if not envs.VLLM_GLM52_WAVEFRONT:
+            raise RuntimeError("Unexpected ubatch slices for GLM-5.2.")
+        if intermediate_tensors is not None or not get_pp_group().is_first_rank:
+            raise RuntimeError("GLM-5.2 wavefront requires pipeline parallel size 1.")
+        if len(context.ubatch_slices) != 2:
+            raise RuntimeError("GLM-5.2 wavefront requires exactly two chunks.")
+        if not isinstance(context.attn_metadata, list) or not isinstance(
+            context.slot_mapping, list
+        ):
+            raise RuntimeError("GLM-5.2 wavefront requires per-lane metadata.")
+        if self.aux_hidden_state_layers or self.output_dflash_anchor_hidden_state:
+            raise RuntimeError("GLM-5.2 wavefront does not support auxiliary outputs.")
+
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            if input_ids is None:
+                raise ValueError("GLM-5.2 wavefront requires input tokens.")
+            hidden_states = self.embed_input_ids(input_ids)
+
+        self._init_wavefront_runtime()
+        assert self._wavefront_streams is not None
+        assert self._wavefront_input_ready is not None
+        assert self._wavefront_done is not None
+        streams = self._wavefront_streams
+        slices = context.ubatch_slices
+        hidden = [hidden_states[item.token_slice] for item in slices]
+        lane_positions = [positions[item.token_slice] for item in slices]
+        residual: list[torch.Tensor | None] = [None, None]
+
+        indices_buffer = self._wavefront_topk_indices_buffer
+        if indices_buffer is None:
+            raise RuntimeError("GLM-5.2 wavefront requires sparse top-k storage.")
+        topk_indices = [indices_buffer[item.token_slice] for item in slices]
+        scores_buffer = self._wavefront_topk_scores_buffer
+        topk_scores = (
+            [scores_buffer[item.token_slice] for item in slices]
+            if scores_buffer is not None
+            else [None, None]
+        )
+
+        lane_contexts = [
+            replace(
+                context,
+                attn_metadata=context.attn_metadata[lane],
+                slot_mapping=context.slot_mapping[lane],
+                ubatch_slices=None,
+                is_padding=(
+                    context.is_padding[slices[lane].token_slice]
+                    if context.is_padding is not None
+                    else None
+                ),
+                moe_layer_index=0,
+                additional_kwargs={
+                    **context.additional_kwargs,
+                    "glm52_wavefront_lane": lane,
+                },
+            )
+            for lane in range(2)
+        ]
+
+        scaling_config = getattr(self.config, "llama_4_scaling", None)
+        lane_scaling: list[torch.Tensor | None] = [None, None]
+        if scaling_config is not None:
+            lane_scaling = [
+                _get_llama_4_scaling(
+                    original_max_position_embeddings=scaling_config[
+                        "original_max_position_embeddings"
+                    ],
+                    scaling_beta=scaling_config["beta"],
+                    positions=lane_position,
+                )
+                for lane_position in lane_positions
+            ]
+
+        current_stream = torch.cuda.current_stream()
+        self._wavefront_input_ready.record(current_stream)
+        for stream in streams:
+            stream.wait_event(self._wavefront_input_ready)
+
+        for local_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
+            oproj_ready = self._wavefront_oproj_ready[local_idx]
+            with (
+                torch.cuda.stream(streams[0]),
+                override_forward_context(lane_contexts[0]),
+                use_workspace_lane(0),
+                _bind_glm_wavefront_topk(layer, topk_indices[0], topk_scores[0]),
+            ):
+                state, lane_residual = layer.forward_wavefront_prefix(
+                    lane_positions[0],
+                    hidden[0],
+                    residual[0],
+                    lane_scaling[0],
+                )
+                residual[0] = lane_residual
+                hidden[0], residual[0] = layer.forward_wavefront_tail(
+                    state, lane_residual, oproj_ready.record
+                )
+
+            streams[1].wait_event(oproj_ready)
+            with (
+                torch.cuda.stream(streams[1]),
+                override_forward_context(lane_contexts[1]),
+                use_workspace_lane(1),
+                _bind_glm_wavefront_topk(layer, topk_indices[1], topk_scores[1]),
+            ):
+                state, lane_residual = layer.forward_wavefront_prefix(
+                    lane_positions[1],
+                    hidden[1],
+                    residual[1],
+                    lane_scaling[1],
+                )
+                residual[1] = lane_residual
+                hidden[1], residual[1] = layer.forward_wavefront_tail(
+                    state, lane_residual
+                )
+
+        for lane, stream in enumerate(streams):
+            self._wavefront_done[lane].record(stream)
+            current_stream.wait_event(self._wavefront_done[lane])
+
+        assert residual[0] is not None and residual[1] is not None
+        hidden_states = torch.cat(hidden, dim=0)
+        combined_residual = torch.cat((residual[0], residual[1]), dim=0)
+        hidden_states, _ = self.norm(hidden_states, combined_residual)
+        return hidden_states
+
+
 class DeepseekV2MixtureOfExperts(MixtureOfExperts):
     moe_mlp_layers: list[DeepseekV2MoE]
     """
@@ -2203,7 +2456,7 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
-    pass
+    model_cls = GlmMoeDsaModel
 
 
 def _should_use_nextn_moe_layer(

@@ -3,6 +3,7 @@
 import json
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache
 
@@ -132,6 +133,16 @@ class MLAModules:
     topk_indices_buffer: torch.Tensor | None
     indexer_rotary_emb: torch.nn.Module | None = None
     g_proj: torch.nn.Module | None = None
+
+
+@dataclass
+class MLAWavefrontState:
+    q: torch.Tensor
+    kv_c_for_cache: torch.Tensor
+    k_pe: torch.Tensor
+    hidden_states: torch.Tensor
+    q_dcp_replicated: torch.Tensor | None
+    cache_state: object
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -302,6 +313,15 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        state = self.forward_wavefront_prefix(positions, hidden_states, llama_4_scaling)
+        return self.forward_wavefront_tail(state)
+
+    def forward_wavefront_prefix(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> MLAWavefrontState:
         q_c = None
         kv_lora = None
 
@@ -372,15 +392,39 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         if self.dcp_q_replicate:
             q_dcp_replicated, q = q, q_proj_layer._local_view(q)
 
-        attn_out = self.mla_attn(
-            q,
+        cache_state = self.mla_attn.forward_cache_update(
             kv_c_for_cache,
             k_pe,
-            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+        )
+        return MLAWavefrontState(
+            q=q,
+            kv_c_for_cache=kv_c_for_cache,
+            k_pe=k_pe,
+            hidden_states=hidden_states,
             q_dcp_replicated=q_dcp_replicated,
+            cache_state=cache_state,
+        )
+
+    def forward_wavefront_tail(
+        self,
+        state: MLAWavefrontState,
+        before_o_proj_reduce: Callable[[], None] | None = None,
+    ) -> torch.Tensor:
+        attn_out = self.mla_attn.forward_after_cache_update(
+            state.q,
+            state.kv_c_for_cache,
+            state.k_pe,
+            state.cache_state,
+            output_shape=(
+                state.hidden_states.shape[0],
+                self.num_heads * self.v_head_dim,
+            ),
+            q_dcp_replicated=state.q_dcp_replicated,
         )
 
         if self.g_proj is not None:
-            attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
+            attn_out = attn_out * self.g_proj(state.hidden_states)[0].sigmoid()
 
-        return self.o_proj(attn_out)[0]
+        if before_o_proj_reduce is None:
+            return self.o_proj(attn_out)[0]
+        return self.o_proj(attn_out, before_reduce=before_o_proj_reduce)[0]

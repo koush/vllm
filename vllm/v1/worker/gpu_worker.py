@@ -433,10 +433,14 @@ class Worker(WorkerBase):
         # Target and speculative captures retain workspace views concurrently,
         # so speculative V2 execution needs a separate ownership lane.
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+        architectures = self.model_config.hf_config.architectures or ()
+        use_glm52_wavefront = (
+            envs.VLLM_GLM52_WAVEFRONT and "GlmMoeDsaForCausalLM" in architectures
+        )
         num_workspace_lanes = (
             2
             if self.use_v2_model_runner
-            and self.vllm_config.speculative_config is not None
+            and (self.vllm_config.speculative_config is not None or use_glm52_wavefront)
             else 1
         )
         init_workspace_manager(self.device, num_ubatches, num_workspace_lanes)

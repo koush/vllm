@@ -411,19 +411,19 @@ class _FakeMetadataBuilder:
 
 class _FakeAttentionGroup:
     def __init__(self, builder: _FakeMetadataBuilder, group_id: int):
-        self.builder = builder
+        self.builders = [builder, _FakeMetadataBuilder()]
         self.kv_cache_spec = SimpleNamespace(group_id=group_id)
         self.layer_names = [f"layer.{group_id}"]
 
     def get_metadata_builder(self, builder_index: int):
-        assert builder_index == 0
-        return self.builder
+        return self.builders[builder_index]
 
 
 def _build_fake_group_metadata(
     builders: list[_FakeMetadataBuilder],
     *,
     for_cudagraph_capture: bool = False,
+    metadata_builder_idx: int = 0,
 ):
     num_groups = len(builders)
     groups = [[_FakeAttentionGroup(builder, i)] for i, builder in enumerate(builders)]
@@ -446,6 +446,7 @@ def _build_fake_group_metadata(
         slot_mappings=torch.zeros((num_groups, 1), dtype=torch.int64),
         kv_cache_config=SimpleNamespace(kv_cache_groups=kv_cache_groups),
         for_cudagraph_capture=for_cudagraph_capture,
+        metadata_builder_idx=metadata_builder_idx,
     )
 
 
@@ -471,3 +472,32 @@ def test_build_attn_metadata_skips_exact_key_during_cudagraph_capture():
         _build_fake_group_metadata([builder], for_cudagraph_capture=True)
 
     cache_key.assert_not_called()
+
+
+def test_build_attn_metadata_selects_builder_index():
+    builder = _FakeMetadataBuilder()
+    groups = [[_FakeAttentionGroup(builder, 0)]]
+    lane_builder = groups[0][0].builders[1]
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(dcp_replicated=False))
+        ]
+    )
+
+    build_attn_metadata(
+        attn_groups=groups,
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_gpu=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        max_query_len=1,
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        max_seq_len=1,
+        block_tables=(torch.tensor([[0]], dtype=torch.int32),),
+        slot_mappings=torch.zeros((1, 1), dtype=torch.int64),
+        kv_cache_config=kv_cache_config,
+        metadata_builder_idx=1,
+    )
+
+    assert builder.num_computed_tokens is None
+    assert lane_builder.num_computed_tokens is not None

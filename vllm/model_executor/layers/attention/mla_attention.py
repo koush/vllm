@@ -1041,6 +1041,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         output_shape: torch.Size | None = None,
         q_dcp_replicated: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        cache_state = self.forward_cache_update(kv_c_normed, k_pe)
+        return self.forward_after_cache_update(
+            q,
+            kv_c_normed,
+            k_pe,
+            cache_state,
+            output_shape=output_shape,
+            q_dcp_replicated=q_dcp_replicated,
+        )
+
+    def forward_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> "tuple[MLACommonMetadata | None, torch.Tensor | None]":
         if self.use_direct_call:
             forward_context: ForwardContext = get_forward_context()
             attn_metadata_raw = forward_context.attn_metadata
@@ -1079,37 +1094,51 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
+            return attn_metadata, None
+        encoded = _encode_layer_name(self.layer_name)
+        kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
+            kv_c_normed,
+            k_pe,
+            encoded,
+            self.kv_cache_dtype,
+            self._k_scale,
+        )
+        return None, kv_cache_dummy_dep
+
+    def forward_after_cache_update(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        cache_state: "tuple[MLACommonMetadata | None, torch.Tensor | None]",
+        output_shape: torch.Size | None = None,
+        q_dcp_replicated: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        attn_metadata, kv_cache_dummy_dep = cache_state
+        if self.use_direct_call:
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
                 kv_c_normed,
                 k_pe,
-                self_kv_cache,
+                self.kv_cache,
                 attn_metadata,
                 output=output,
                 q_dcp_replicated=q_dcp_replicated,
             )
             return output
-        else:
-            encoded = _encode_layer_name(self.layer_name)
-            kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
-                kv_c_normed,
-                k_pe,
-                encoded,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
-            output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
-            torch.ops.vllm.unified_mla_attention_with_output(
-                q,
-                kv_c_normed,
-                k_pe,
-                output,
-                encoded,
-                kv_cache_dummy_dep=kv_cache_dummy_dep,
-                q_dcp_replicated=q_dcp_replicated,
-            )
-            return output
+        encoded = _encode_layer_name(self.layer_name)
+        output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+        torch.ops.vllm.unified_mla_attention_with_output(
+            q,
+            kv_c_normed,
+            k_pe,
+            output,
+            encoded,
+            kv_cache_dummy_dep=kv_cache_dummy_dep,
+            q_dcp_replicated=q_dcp_replicated,
+        )
+        return output
 
     def _try_fused_mla_query(
         self,

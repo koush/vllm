@@ -272,6 +272,18 @@ class TestLSEWeightedCombine:
         torch.testing.assert_close(masked_lse[1:5], torch.ones_like(masked_lse[1:5]))
         assert torch.isneginf(masked_lse[5:]).all()
 
+    def test_masks_all_lse_when_rank_has_no_sequences(self):
+        from vllm.v1.attention.ops.common import mask_dcp_empty_shards_
+
+        lse = torch.ones(3, 2)
+        mask_dcp_empty_shards_(
+            lse,
+            torch.empty(0, dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int32),
+        )
+
+        assert torch.isneginf(lse).all()
+
     def test_mathematically_correct(self):
         """Verify mathematical correctness of LSE combination."""
         from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
@@ -1106,6 +1118,24 @@ def test_b12x_query_gather_requires_env(monkeypatch: pytest.MonkeyPatch):
     )
 
     assert actual is expected
+
+
+def test_b12x_wavefront_uses_lane_channels(monkeypatch: pytest.MonkeyPatch):
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_GLM52_WAVEFRONT", "1")
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={},
+        additional_kwargs={"glm52_wavefront_lane": 1},
+    )
+    with override_forward_context(context):
+        assert dcp_alltoall._b12x_dcp_eager_channel_id() == "vllm:eager:dcp:wavefront:1"
+
+    monkeypatch.delenv("VLLM_GLM52_WAVEFRONT")
+    assert dcp_alltoall._b12x_dcp_eager_channel_id() == "vllm:eager:dcp"
 
 
 def test_warmup_skips_unsupported_world_size(monkeypatch: pytest.MonkeyPatch):

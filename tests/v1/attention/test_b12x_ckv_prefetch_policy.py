@@ -9,8 +9,10 @@ import pytest
 import torch
 
 import vllm.v1.worker.workspace as workspace
+from vllm.v1.attention.backends.mla import b12x_mla_sparse
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseImpl,
+    _ckv_prefetch_depth_for_lane,
     _ckv_prefetch_depth_within_budget,
     _ckv_prefetch_execution_lanes,
     _ckv_prefetch_ring_slots,
@@ -20,6 +22,7 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     _ckv_workspace_identity,
     _CKVPrefetchStateRegistry,
     _CKVPrefetchWorkspacePool,
+    link_glm52_wavefront_ckv_metadata,
 )
 
 
@@ -65,13 +68,52 @@ def test_ckv_prefetch_budget_caps_depth_but_keeps_sync_slot():
 
 
 @pytest.mark.parametrize(
-    ("num_ubatches", "speculative", "expected"),
-    [(0, False, 1), (1, False, 1), (2, False, 2), (1, True, 2), (2, True, 4)],
+    ("num_ubatches", "speculative", "wavefront", "expected"),
+    [
+        (0, False, False, 1),
+        (1, False, False, 1),
+        (2, False, False, 2),
+        (1, True, False, 2),
+        (2, True, False, 4),
+        (1, False, True, 1),
+        (1, True, True, 2),
+    ],
 )
 def test_ckv_prefetch_execution_lanes_cover_dbo_and_speculation(
-    num_ubatches, speculative, expected
+    num_ubatches, speculative, wavefront, expected
 ):
-    assert _ckv_prefetch_execution_lanes(num_ubatches, speculative) == expected
+    assert (
+        _ckv_prefetch_execution_lanes(num_ubatches, speculative, wavefront) == expected
+    )
+
+
+def test_wavefront_lane_one_uses_sync_gather_without_lookahead():
+    assert _ckv_prefetch_depth_for_lane(1, 0) == 1
+    assert _ckv_prefetch_depth_for_lane(1, 1) == 0
+    assert _ckv_prefetch_depth_for_lane(1, None) == 1
+
+
+def test_wavefront_ckv_lanes_share_final_gather_layout_and_handoff():
+    lane_0 = SimpleNamespace(num_reqs=1, dcp_padded_total_tokens=256)
+    lane_1 = SimpleNamespace(num_reqs=1, dcp_padded_total_tokens=512)
+
+    link_glm52_wavefront_ckv_metadata(lane_0, lane_1)
+
+    assert lane_0.dcp_padded_total_tokens == 512
+    assert lane_0.ckv_wavefront_lane == 0
+    assert lane_1.ckv_wavefront_lane == 1
+    assert lane_0.ckv_wavefront_handoff is lane_1.ckv_wavefront_handoff
+
+
+@pytest.mark.parametrize(("value", "expected"), [(0, 0), (1, 1), (2, None)])
+def test_ckv_prefetch_reads_wavefront_lane_from_forward_context(
+    monkeypatch, value, expected
+):
+    context = SimpleNamespace(additional_kwargs={"glm52_wavefront_lane": value})
+    monkeypatch.setattr(b12x_mla_sparse, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(b12x_mla_sparse, "get_forward_context", lambda: context)
+
+    assert b12x_mla_sparse._glm52_wavefront_lane() == expected
 
 
 def test_ckv_prefetch_supports_native_full_record_formats():

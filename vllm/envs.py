@@ -69,6 +69,8 @@ if TYPE_CHECKING:
     VLLM_NF3_GRID188_DECODE: bool = True
     VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
     VLLM_USE_B12X_DCP_A2A: bool = False
+    VLLM_GLM52_WAVEFRONT: bool = False
+    VLLM_GLM52_WAVEFRONT_CHUNK_SIZE: int = 2048
     VLLM_DCP_PROJECT_BEFORE_MERGE: bool = False
     VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS: int = 1024
     VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE: bool = False
@@ -1163,6 +1165,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Use b12x PCIe collectives for DCP query gather and output reduction.
     "VLLM_USE_B12X_DCP_A2A": lambda: bool(int(os.getenv("VLLM_USE_B12X_DCP_A2A", "0"))),
+    "VLLM_GLM52_WAVEFRONT": lambda: bool(int(os.getenv("VLLM_GLM52_WAVEFRONT", "0"))),
+    "VLLM_GLM52_WAVEFRONT_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_GLM52_WAVEFRONT_CHUNK_SIZE", "2048")
+    ),
     # Project rank-local sparse MLA partials before their DCP merge. This is
     # opt-in until the guarded TP4 path has been benchmarked against baseline.
     "VLLM_DCP_PROJECT_BEFORE_MERGE": lambda: bool(
